@@ -1,0 +1,3 @@
+[submodule "grievance-frontend"]
+	path = grievance-frontend
+	url = https://github.com/iharmandeepsingh/Grievance.git
