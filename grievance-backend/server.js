@@ -1,6 +1,6 @@
 // server.js — Grievance Portal Backend (MongoDB + Twilio)
-// Requires: dotenv, express, cors, body-parser, mongoose, twilio, nanoid
-// Make sure your package.json has "type": "module"
+// Requires: dotenv, express, cors, body-parser, mongoose, twilio, nanoid, bcrypt, jsonwebtoken
+// Ensure package.json has "type": "module"
 
 // ------------------ 1️⃣ Core imports ------------------
 import express from "express";
@@ -12,6 +12,8 @@ dotenv.config();
 import mongoose from "mongoose";
 import twilio from "twilio";
 import { nanoid } from "nanoid";
+import bcrypt from "bcrypt";
+import jwt from "jsonwebtoken";
 
 // ------------------ 2️⃣ Connect to MongoDB ------------------
 async function connectDB() {
@@ -24,14 +26,10 @@ async function connectDB() {
   }
 }
 await connectDB();
-console.log("🔍 ENV check:");
-console.log("MONGO_URI:", process.env.MONGO_URI ? "loaded" : "missing");
-console.log("TWILIO_SID:", process.env.TWILIO_SID ? "loaded" : "missing");
-console.log("TWILIO_FROM:", process.env.TWILIO_FROM ? process.env.TWILIO_FROM : "missing");
 
 // ------------------ 3️⃣ Twilio client ------------------
 if (!process.env.TWILIO_SID || !process.env.TWILIO_TOKEN) {
-  console.warn("⚠️ Twilio credentials not found in .env. SMS won't work.");
+  console.warn("⚠️ Twilio credentials not found. SMS will not be sent.");
 }
 const twilioClient = twilio(process.env.TWILIO_SID, process.env.TWILIO_TOKEN);
 
@@ -45,14 +43,14 @@ app.use(
 );
 app.use(bodyParser.json());
 
-// ------------------ 5️⃣ Define Schemas & Models ------------------
+// ------------------ 5️⃣ Schemas & Models ------------------
 const userSchema = new mongoose.Schema({
   id: { type: String, required: true, unique: true },
   role: { type: String, enum: ["student", "staff", "admin"], required: true },
   fullName: String,
   email: String,
   phone: String,
-  password: String,
+  password: String, // stored hashed
   program: String,
 });
 
@@ -88,15 +86,17 @@ app.get("/", (req, res) => {
   res.send("✅ Grievance Portal Backend Running (MongoDB + Twilio)");
 });
 
-// ------------------ Register Endpoint ------------------
+// ------------------ Register ------------------
 app.post("/api/auth/register", async (req, res) => {
   try {
     const { id, role, fullName, email, phone, password, program } = req.body;
     if (!id || !phone || !password || !role)
-      return res.status(400).json({ message: "Missing fields" });
+      return res.status(400).json({ message: "Missing required fields" });
 
     const exists = await User.findOne({ id });
     if (exists) return res.status(400).json({ message: "User already exists" });
+
+    const hashedPassword = await bcrypt.hash(password, 10);
 
     const newUser = await User.create({
       id,
@@ -104,14 +104,14 @@ app.post("/api/auth/register", async (req, res) => {
       fullName,
       email,
       phone,
-      password,
+      password: hashedPassword,
       program,
     });
 
-    return res.status(201).json({ message: "Registered", user: newUser });
+    res.status(201).json({ message: "Registered successfully", user: newUser });
   } catch (err) {
-    console.error("❌ Error /api/auth/register:", err);
-    return res.status(500).json({ message: "Internal server error" });
+    console.error("❌ /register:", err);
+    res.status(500).json({ message: "Internal server error" });
   }
 });
 
@@ -124,9 +124,7 @@ app.post("/api/auth/request-otp", async (req, res) => {
 
     const user = await User.findOne({ role, id, phone });
     if (!user)
-      return res
-        .status(404)
-        .json({ message: "User not found or phone mismatch" });
+      return res.status(404).json({ message: "User not found or phone mismatch" });
 
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
 
@@ -136,7 +134,7 @@ app.post("/api/auth/request-otp", async (req, res) => {
       phone,
       otp,
       createdAt: Date.now(),
-      expiresAt: Date.now() + 5 * 60 * 1000,
+      expiresAt: Date.now() + 5 * 60 * 1000, // expires in 5 min
     });
 
     if (
@@ -145,55 +143,105 @@ app.post("/api/auth/request-otp", async (req, res) => {
       process.env.TWILIO_FROM
     ) {
       try {
-        console.log(`📨 Sending OTP to +91${phone}...`);
-        const message = await twilioClient.messages.create({
+        await twilioClient.messages.create({
           body: `Your Grievance Portal OTP is ${otp}`,
           from: process.env.TWILIO_FROM,
           to: `+91${phone}`,
         });
-        console.log(`✅ Twilio Message SID: ${message.sid}`);
-        return res.json({ message: "OTP sent successfully", otpId: otpRecord._id });
-      } catch (twErr) {
-        console.error("❌ Twilio send error:", twErr.message);
+        console.log(`✅ OTP sent via Twilio to +91${phone}`);
+      } catch (err) {
+        console.error("❌ Twilio send error:", err.message);
       }
+    } else {
+      console.log(`🧩 Mock OTP for ${id}: ${otp}`);
     }
 
-    console.log(`🧩 Mock OTP for ${role} (${id}): ${otp}`);
-    return res.json({ message: "OTP sent (mock)", otpId: otpRecord._id, otp });
+    res.json({ message: "OTP generated", otpId: otpRecord._id });
   } catch (err) {
-    console.error("❌ Error /api/auth/request-otp:", err);
-    return res.status(500).json({ message: "Internal server error" });
+    console.error("❌ /request-otp:", err);
+    res.status(500).json({ message: "Internal server error" });
   }
 });
 
-// ------------------ Verify OTP ------------------
-app.post("/api/auth/verify-otp", async (req, res) => {
-  try {
-    const { id, otp } = req.body;
-    if (!id || !otp) return res.status(400).json({ message: "Missing fields" });
 
+
+// ------------------ Verify OTP + Password ------------------
+app.post("/api/auth/verify-otp-password", async (req, res) => {
+  try {
+    const { id, otp, password, role } = req.body;
+    if (!id || !otp || !password || !role)
+      return res.status(400).json({ message: "Missing fields" });
+
+    // Step 1: Verify OTP exists and is valid
     const record = await OTP.findOne({ userId: id, otp });
     if (!record) return res.status(400).json({ message: "Invalid OTP" });
-
     if (Date.now() > record.expiresAt) {
       await OTP.deleteOne({ _id: record._id });
       return res.status(400).json({ message: "OTP expired" });
     }
 
-    const user = await User.findOne({ id: record.userId });
+    // Step 2: Get user
+    const user = await User.findOne({ id, role });
     if (!user) return res.status(404).json({ message: "User not found" });
 
+    // Step 3: Compare password (bcrypt check)
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) return res.status(400).json({ message: "Incorrect password" });
+
+    // Step 4: Delete OTP (for security)
     await OTP.deleteOne({ _id: record._id });
 
-    return res.json({
-      message: "Verified",
+    // Step 5: Return success
+    res.json({
+      message: "Verified successfully",
       role: user.role,
       id: user.id,
       token: "mock-jwt-token",
     });
   } catch (err) {
-    console.error("❌ Error /api/auth/verify-otp:", err);
-    return res.status(500).json({ message: "Internal server error" });
+    console.error("❌ Error /api/auth/verify-otp-password:", err);
+    res.status(500).json({ message: "Internal server error" });
+  }
+});
+
+
+
+// ------------------ ✅ Verify OTP + Password (New Endpoint) ------------------
+app.post("/api/auth/verify-otp-password", async (req, res) => {
+  try {
+    const { id, otp, password, role } = req.body;
+    if (!id || !otp || !password || !role)
+      return res.status(400).json({ message: "Missing fields" });
+
+    // 1️⃣ Check user
+    const user = await User.findOne({ id, role });
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    // 2️⃣ Check OTP
+    const otpRecord = await OTP.findOne({ userId: id, otp });
+    if (!otpRecord) return res.status(400).json({ message: "Invalid OTP" });
+    if (Date.now() > otpRecord.expiresAt) {
+      await OTP.deleteOne({ _id: otpRecord._id });
+      return res.status(400).json({ message: "OTP expired" });
+    }
+
+    // 3️⃣ Check password
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) return res.status(400).json({ message: "Invalid password" });
+
+    // 4️⃣ Success
+    await OTP.deleteOne({ _id: otpRecord._id });
+    const token = jwt.sign({ id: user.id, role: user.role }, "mock_secret");
+
+    res.json({
+      message: "✅ OTP + Password verified successfully",
+      id: user.id,
+      role: user.role,
+      token,
+    });
+  } catch (err) {
+    console.error("❌ /verify-otp-password:", err);
+    res.status(500).json({ message: "Internal server error" });
   }
 });
 
@@ -213,26 +261,28 @@ app.post("/api/grievances", async (req, res) => {
       message,
     });
 
-    return res
+    res
       .status(201)
       .json({ message: "Grievance submitted successfully", newGrievance });
   } catch (err) {
-    console.error("❌ Error /api/grievances:", err);
-    return res.status(500).json({ message: "Internal server error" });
+    console.error("❌ /grievances POST:", err);
+    res.status(500).json({ message: "Internal server error" });
   }
 });
 
-// ------------------ Get All Grievances (for staff/admin) ------------------
+// ------------------ Get All Grievances ------------------
 app.get("/api/grievances", async (req, res) => {
   try {
     const grievances = await Grievance.find().sort({ createdAt: -1 }).lean();
-    return res.json(grievances);
+    res.json(grievances);
   } catch (err) {
-    console.error("❌ Error /api/grievances GET:", err);
-    return res.status(500).json({ message: "Internal server error" });
+    console.error("❌ /grievances GET:", err);
+    res.status(500).json({ message: "Internal server error" });
   }
 });
 
 // ------------------ 7️⃣ Start server ------------------
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`🚀 Server running on http://localhost:${PORT}`));
+app.listen(PORT, () =>
+  console.log(`🚀 Server running at http://localhost:${PORT}`)
+);
